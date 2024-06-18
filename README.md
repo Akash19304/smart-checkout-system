@@ -1,4 +1,4 @@
 # smart-checkout-system
-A computer vision based checkout system that can detected objects using YOLO V8 and calculates the price of the products.
+A computer vision based checkout system that detecta objects using YOLO V8 Model and calculatea the price of all products that crosses the checkout line.
 
 ![alt text](output4.gif)
