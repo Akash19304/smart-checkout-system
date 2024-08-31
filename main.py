@@ -1,20 +1,16 @@
 from ultralytics import YOLO
 import cv2
 import supervision as sv
+import numpy as np
 from utils import get_product_cost
 
-
 # coordinates for the line
-START = sv.Point(360, 0) 
+START = sv.Point(360, 0)
 END = sv.Point(360, 720)
 
+model = YOLO('model/yolov8s.pt')
 
-model = YOLO('model\yolov8n.pt')
-
-
-video_path = "test_videos/video4.mp4"
-cap = cv2.VideoCapture(video_path)
-
+cap = cv2.VideoCapture(0)  # Use 0 for the primary webcam
 
 """
 - YOLO V8 classes:
@@ -30,82 +26,90 @@ cap = cv2.VideoCapture(video_path)
 73: 'book', 74: 'clock', 75: 'vase', 76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'}
 """
 
-
-# change the costs of the products according to above classes
-product_costs = {39: 10,  
-                 76: 15,
-                 46: 20,
-                 47: 25,
-                 49: 20 
-                }
-
+product_costs = {
+    39: 10,
+    76: 15,
+    46: 20,
+    47: 25,
+    49: 20,
+    65: 50,
+    47: 38
+}
 
 # Initialize products with empty dictionaries for each class
 products = {class_id: {} for class_id in product_costs}
 
-video_info = sv.VideoInfo.from_video_path(video_path)
+# Get video information manually
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = int(cap.get(cv2.CAP_PROP_FPS))
+video_info = sv.VideoInfo(width=frame_width, height=frame_height, fps=fps)
 
-with sv.VideoSink(target_path="test_output/output4.mp4", video_info=video_info) as sink:
-
+with sv.VideoSink(target_path="test_output/webcam_output.mp4", video_info=video_info) as sink:
     while cap.isOpened():
         success, frame = cap.read()
 
-        if success:
-            results = model.track(frame, classes=list(product_costs.keys()), persist=True,
-                                  save=True, tracker="bytetrack.yaml")
+        if not success:
+            break
 
-            # get the boxes
-            boxes = results[0].boxes.xywh.cpu()
-            track_ids = results[0].boxes.id.int().cpu().tolist()
-            cls = results[0].boxes.cls.int().cpu().tolist()
+        results = model.track(frame, classes=list(product_costs.keys()), persist=True, save=True, tracker="bytetrack.yaml")
 
-            # visualize the results on the frame
+        # Check if there are any detections
+        if results[0].boxes is not None and results[0].boxes.xywh is not None:
+            boxes = results[0].boxes.xywh.cpu().numpy()
+            track_ids = results[0].boxes.id
+            if track_ids is not None:
+                track_ids = track_ids.int().cpu().numpy()
+            else:
+                track_ids = np.zeros(len(boxes))  # or handle appropriately if no IDs are assigned
+            cls = results[0].boxes.cls.int().cpu().numpy()
+
             annotated_frame = results[0].plot()
             detections = sv.Detections.from_ultralytics(results[0])
 
             for box, track_id, class_id in zip(boxes, track_ids, cls):
                 x, y, w, h = box
+                x_center = x
+                y_center = y
+                x_left = x_center - w / 2
+                y_top = y_center - h / 2
+                x_right = x_center + w / 2
+                y_bottom = y_center + h / 2
 
-                if START.y < y < END.y and x > START.x:
+                if START.y < y_center < END.y:
+                    if x_center > START.x:
+                        if track_id not in products[class_id]:
+                            products[class_id][track_id] = {'tracked': True}
+                            cv2.rectangle(annotated_frame, (int(x_left), int(y_top)), (int(x_right), int(y_bottom)), (0, 255, 0), 2)
+                    else:
+                        if track_id in products[class_id]:
+                            was_tracked = products[class_id][track_id]['tracked']
+                            products[class_id][track_id]['tracked'] = False
 
-                    if track_id not in products[class_id]:
-                        products[class_id][track_id] = {'tracked': True}
+                            if was_tracked:
+                                total_cost -= product_costs.get(class_id, 0)
 
-                        cv2.rectangle(annotated_frame, (int(x - w/2), int(y - h/2)), (int(x + w/2), int(y + h/2)),
-                                      (0, 255, 0), 2)
-
-                if START.y < y < END.y and x < START.x:
-
-                    if track_id in products[class_id]:
-                        was_tracked = products[class_id][track_id]['tracked']
-                        products[class_id][track_id]['tracked'] = False
-
-                        # Subtract the cost if the product was previously tracked
-                        if was_tracked:
-                            total_cost -= product_costs.get(class_id, 0)
-
-                        cv2.rectangle(annotated_frame, (int(x - w/2), int(y - h/2)), (int(x + w/2), int(y + h/2)),
-                                    (0, 255, 0), 2)
-
-                        print("-"*20)
-                        print(f"Class ID: {class_id}")
+                            cv2.rectangle(annotated_frame, (int(x_left), int(y_top)), (int(x_right), int(y_bottom)), (0, 255, 0), 2)
+                            print(f"Class ID: {class_id}")
 
             cv2.line(annotated_frame, (START.x, START.y), (END.x, END.y), (0, 255, 0), 2)
 
-
-            total_cost = sum([get_product_cost(products, product_costs, class_id, track_id) 
-                              for class_id in product_costs 
-                              for track_id in products.get(class_id, {})])
-            
+            total_cost = 0
+            for class_id, tracks in products.items():
+                for track_id, track_info in tracks.items():
+                    if track_info['tracked']:
+                        total_cost += product_costs[class_id]
 
             cost_text = f"Total Cost: {total_cost}"
             print(cost_text)
 
             cv2.putText(annotated_frame, cost_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
             sink.write_frame(annotated_frame)
 
-        else:
+            cv2.imshow('Smart Checkout System', annotated_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
 cap.release()
+cv2.destroyAllWindows()
