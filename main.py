@@ -5,12 +5,28 @@ import numpy as np
 from collections import defaultdict
 import torch
 
+"""
+- YOLO V8 classes:
+
+{0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 
+10: 'fire hydrant', 11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 
+19: 'cow', 20: 'elephant', 21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag', 27: 'tie', 28: 'suitcase', 
+29: 'frisbee', 30: 'skis', 31: 'snowboard', 32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove', 36: 'skateboard', 
+37: 'surfboard', 38: 'tennis racket', 39: 'bottle', 40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl', 
+46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 
+55: 'cake', 56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table', 61: 'toilet', 62: 'tv', 63: 'laptop', 
+64: 'mouse', 65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven', 70: 'toaster', 71: 'sink', 72: 'refrigerator', 
+73: 'book', 74: 'clock', 75: 'vase', 76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'}
+"""
+
 class SmartCheckoutSystem:
     def __init__(self, model_path='model/yolov8s.pt', line_start=(360, 0), line_end=(360, 720)):
         self.START = sv.Point(*line_start)
         self.END = sv.Point(*line_end)
         
         # Product costs dictionary
+        # add products in this dictionary with their respective costs according to the YOLO V8 classes
+        # Or better yet fine tune your own model as per your products
         self.product_costs = {
             39: 10,  # bottle
             76: 15,  # scissors
@@ -20,7 +36,7 @@ class SmartCheckoutSystem:
             65: 50,  # remote
         }
         
-        # Color mapping for different classes
+        # Added colors because why not 
         self.colors = {
             39: (0, 255, 0),    # bottle - green
             76: (255, 0, 0),    # scissors - red
@@ -49,6 +65,7 @@ class SmartCheckoutSystem:
 
     def _setup_model(self, model_path):
         model = YOLO(model_path)
+        # need to do something about gpu
         if torch.cuda.is_available():
             model.to('cuda')
         return model
@@ -149,7 +166,7 @@ class SmartCheckoutSystem:
         # Draw text
         cv2.putText(frame, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         
-        # Draw tracking ID
+        # tracking ID
         cv2.putText(frame, f"ID: {track_id}", (x1, y2+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
     def process_frame(self, frame):
@@ -211,7 +228,7 @@ class SmartCheckoutSystem:
                     self.products[class_id][track_id]['tracked'] = False
                     self.total_cost -= self.product_costs[class_id]
             
-            # Draw bounding box with product information
+            # Draw bounding box 
             self.draw_bounding_box(frame, det, class_id)
 
         # Add the static line overlay
@@ -241,7 +258,7 @@ class SmartCheckoutSystem:
 
                 annotated_frame, total_cost = self.process_frame(frame)
                 
-                # Add cost text with background
+                # Cost text background
                 cost_text = f"Total Cost: ${total_cost:.2f}"
                 (text_w, text_h), _ = cv2.getTextSize(cost_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
                 cv2.rectangle(annotated_frame, (5, 5), (15 + text_w, 40), (0, 0, 0), -1)
@@ -265,10 +282,8 @@ class SmartCheckoutSystem:
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    # Initialize the checkout system
     checkout_system = SmartCheckoutSystem()
     
-    # Example usage:
     # 1. For webcam (default)
     checkout_system.run()
     
