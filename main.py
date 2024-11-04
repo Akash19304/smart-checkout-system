@@ -2,114 +2,275 @@ from ultralytics import YOLO
 import cv2
 import supervision as sv
 import numpy as np
-from utils import get_product_cost
+from collections import defaultdict
+import torch
 
-# coordinates for the line
-START = sv.Point(360, 0)
-END = sv.Point(360, 720)
+class SmartCheckoutSystem:
+    def __init__(self, model_path='model/yolov8s.pt', line_start=(360, 0), line_end=(360, 720)):
+        self.START = sv.Point(*line_start)
+        self.END = sv.Point(*line_end)
+        
+        # Product costs dictionary
+        self.product_costs = {
+            39: 10,  # bottle
+            76: 15,  # scissors
+            46: 20,  # banana
+            47: 25,  # apple
+            49: 20,  # orange
+            65: 50,  # remote
+        }
+        
+        # Color mapping for different classes
+        self.colors = {
+            39: (0, 255, 0),    # bottle - green
+            76: (255, 0, 0),    # scissors - red
+            46: (255, 255, 0),  # banana - yellow
+            47: (0, 255, 255),  # apple - cyan
+            49: (255, 0, 255),  # orange - magenta
+            65: (0, 165, 255),  # remote - orange
+        }
+        
+        # Initialize model with optimized settings
+        self.model = self._setup_model(model_path)
+        
+        # Initialize tracking state with defaultdict
+        self.products = defaultdict(lambda: defaultdict(lambda: {'tracked': False}))
+        self.total_cost = 0
+        
+        # Pre-calculate valid classes
+        self.valid_classes = list(self.product_costs.keys())
+        
+        # Initialize detection buffer for smoothing
+        self.detection_buffer = []
+        self.buffer_size = 3
+        
+        # Initialize line overlay
+        self.line_overlay = None
 
-model = YOLO('model/yolov8s.pt')
+    def _setup_model(self, model_path):
+        model = YOLO(model_path)
+        if torch.cuda.is_available():
+            model.to('cuda')
+        return model
 
-cap = cv2.VideoCapture(0)  # Use 0 for the primary webcam
+    def _create_line_overlay(self, frame_shape):
+        """Create a static overlay for the checkout line"""
+        overlay = np.zeros(frame_shape, dtype=np.uint8)
+        # Draw a solid line
+        cv2.line(overlay, 
+                 (self.START.x, self.START.y), 
+                 (self.END.x, self.END.y), 
+                 (0, 255, 0), 
+                 2)
+        # Add a semi-transparent background
+        cv2.line(overlay, 
+                 (self.START.x, self.START.y), 
+                 (self.END.x, self.END.y), 
+                 (0, 255, 0), 
+                 6, 
+                 cv2.LINE_AA)
+        return overlay
 
-"""
-- YOLO V8 classes:
+    def setup_video_source(self, source):
+        """Setup video source for either webcam or video file"""
+        cap = cv2.VideoCapture(source)
+        
+        # Set buffer size and FPS for webcam only
+        if isinstance(source, int):
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+        
+        if not cap.isOpened():
+            raise ValueError(f"Failed to open video source: {source}")
+            
+        return cap, self._get_video_info(cap)
 
-{0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 
-10: 'fire hydrant', 11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 
-19: 'cow', 20: 'elephant', 21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag', 27: 'tie', 28: 'suitcase', 
-29: 'frisbee', 30: 'skis', 31: 'snowboard', 32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove', 36: 'skateboard', 
-37: 'surfboard', 38: 'tennis racket', 39: 'bottle', 40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl', 
-46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 
-55: 'cake', 56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table', 61: 'toilet', 62: 'tv', 63: 'laptop', 
-64: 'mouse', 65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven', 70: 'toaster', 71: 'sink', 72: 'refrigerator', 
-73: 'book', 74: 'clock', 75: 'vase', 76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'}
-"""
+    def _get_video_info(self, cap):
+        return sv.VideoInfo(
+            width=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            height=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            fps=int(cap.get(cv2.CAP_PROP_FPS))
+        )
 
-product_costs = {
-    39: 10,
-    76: 15,
-    46: 20,
-    47: 25,
-    49: 20,
-    65: 50,
-    47: 38
-}
+    def _smooth_detections(self, new_detections):
+        if not isinstance(new_detections, np.ndarray):
+            return new_detections
+            
+        self.detection_buffer.append(new_detections)
+        if len(self.detection_buffer) > self.buffer_size:
+            self.detection_buffer.pop(0)
+            
+        if len(self.detection_buffer) >= 2:
+            latest = self.detection_buffer[-1]
+            prev = self.detection_buffer[-2]
+            
+            if len(latest) == len(prev):
+                latest[:, :4] = 0.6 * latest[:, :4] + 0.4 * prev[:, :4]
+                
+        return self.detection_buffer[-1]
 
-# Initialize products with empty dictionaries for each class
-products = {class_id: {} for class_id in product_costs}
+    def draw_bounding_box(self, frame, det, class_id):
+        """Draw a better looking bounding box with product information"""
+        x_center, y_center, w, h = det[:4]
+        track_id = int(det[4])
+        
+        # Calculate box coordinates
+        x1 = int(x_center - w/2)
+        y1 = int(y_center - h/2)
+        x2 = int(x_center + w/2)
+        y2 = int(y_center + h/2)
+        
+        color = self.colors.get(class_id, (0, 255, 0))
+        
+        # Draw filled rectangle with transparency
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+        cv2.addWeighted(overlay, 0.2, frame, 0.8, 0, frame)
+        
+        # Draw solid border
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        
+        # Add product information
+        product_names = {
+            39: "Bottle",
+            76: "Scissors",
+            46: "Banana",
+            47: "Apple",
+            49: "Orange",
+            65: "Remote"
+        }
+        
+        label = f"{product_names.get(class_id, 'Unknown')} (${self.product_costs.get(class_id, 0)})"
+        
+        # Draw background for text
+        (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+        cv2.rectangle(frame, (x1, y1-20), (x1 + label_w, y1), color, -1)
+        
+        # Draw text
+        cv2.putText(frame, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        # Draw tracking ID
+        cv2.putText(frame, f"ID: {track_id}", (x1, y2+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-# Get video information manually
-frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps = int(cap.get(cv2.CAP_PROP_FPS))
-video_info = sv.VideoInfo(width=frame_width, height=frame_height, fps=fps)
+    def process_frame(self, frame):
+        # Initialize line overlay if not already done
+        if self.line_overlay is None:
+            self.line_overlay = self._create_line_overlay(frame.shape)
 
-with sv.VideoSink(target_path="test_output/webcam_output.mp4", video_info=video_info) as sink:
-    while cap.isOpened():
-        success, frame = cap.read()
+        # Run inference with optimized settings
+        with torch.no_grad():
+            results = self.model.track(
+                frame,
+                classes=self.valid_classes,
+                persist=True,
+                tracker="bytetrack.yaml",
+                verbose=False,
+                conf=0.5,
+                iou=0.5
+            )
 
-        if not success:
-            break
+        if not results or not results[0].boxes:
+            # Add the static line overlay
+            frame = cv2.addWeighted(frame, 1, self.line_overlay, 0.7, 0)
+            return frame, self.total_cost
 
-        results = model.track(frame, classes=list(product_costs.keys()), persist=True, save=True, tracker="bytetrack.yaml")
+        boxes = results[0].boxes
+        if boxes.id is None:
+            # Add the static line overlay
+            frame = cv2.addWeighted(frame, 1, self.line_overlay, 0.7, 0)
+            return frame, self.total_cost
 
-        # Check if there are any detections
-        if results[0].boxes is not None and results[0].boxes.xywh is not None:
-            boxes = results[0].boxes.xywh.cpu().numpy()
-            track_ids = results[0].boxes.id
-            if track_ids is not None:
-                track_ids = track_ids.int().cpu().numpy()
+        detections = np.column_stack([
+            boxes.xywh.cpu().numpy(),
+            boxes.id.cpu().numpy(),
+            boxes.cls.cpu().numpy()
+        ])
+
+        smoothed_detections = self._smooth_detections(detections)
+        
+        # Process detections
+        centers = smoothed_detections[:, :2]
+        mask_within_y = (self.START.y < centers[:, 1]) & (centers[:, 1] < self.END.y)
+        
+        # Draw bounding boxes and process detections
+        for det in smoothed_detections[mask_within_y]:
+            x_center = det[0]
+            track_id = int(det[4])
+            class_id = int(det[5])
+            
+            if class_id not in self.product_costs:
+                continue
+                
+            # Update tracking and costs
+            if x_center > self.START.x:
+                if not self.products[class_id][track_id]['tracked']:
+                    self.products[class_id][track_id]['tracked'] = True
+                    self.total_cost += self.product_costs[class_id]
             else:
-                track_ids = np.zeros(len(boxes))  # or handle appropriately if no IDs are assigned
-            cls = results[0].boxes.cls.int().cpu().numpy()
+                if self.products[class_id][track_id]['tracked']:
+                    self.products[class_id][track_id]['tracked'] = False
+                    self.total_cost -= self.product_costs[class_id]
+            
+            # Draw bounding box with product information
+            self.draw_bounding_box(frame, det, class_id)
 
-            annotated_frame = results[0].plot()
-            detections = sv.Detections.from_ultralytics(results[0])
+        # Add the static line overlay
+        frame = cv2.addWeighted(frame, 1, self.line_overlay, 0.7, 0)
+        
+        return frame, self.total_cost
 
-            for box, track_id, class_id in zip(boxes, track_ids, cls):
-                x, y, w, h = box
-                x_center = x
-                y_center = y
-                x_left = x_center - w / 2
-                y_top = y_center - h / 2
-                x_right = x_center + w / 2
-                y_bottom = y_center + h / 2
+    def run(self, source=0):
+        """
+        Run the smart checkout system on either webcam or video file
+        Args:
+            source: Integer for webcam index or string for video file path
+        """
+        cap, video_info = self.setup_video_source(source)
+        
+        # Reset tracking state for new session
+        self.products.clear()
+        self.total_cost = 0
+        self.detection_buffer.clear()
+        self.line_overlay = None
+        
+        with sv.VideoSink("test_output/output.mp4", video_info) as sink:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-                if START.y < y_center < END.y:
-                    if x_center > START.x:
-                        if track_id not in products[class_id]:
-                            products[class_id][track_id] = {'tracked': True}
-                            cv2.rectangle(annotated_frame, (int(x_left), int(y_top)), (int(x_right), int(y_bottom)), (0, 255, 0), 2)
-                    else:
-                        if track_id in products[class_id]:
-                            was_tracked = products[class_id][track_id]['tracked']
-                            products[class_id][track_id]['tracked'] = False
+                annotated_frame, total_cost = self.process_frame(frame)
+                
+                # Add cost text with background
+                cost_text = f"Total Cost: ${total_cost:.2f}"
+                (text_w, text_h), _ = cv2.getTextSize(cost_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
+                cv2.rectangle(annotated_frame, (5, 5), (15 + text_w, 40), (0, 0, 0), -1)
+                cv2.putText(
+                    annotated_frame,
+                    cost_text,
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 255, 255),
+                    2
+                )
+                
+                sink.write_frame(annotated_frame)
+                cv2.imshow('Smart Checkout System', annotated_frame)
+                
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
 
-                            if was_tracked:
-                                total_cost -= product_costs.get(class_id, 0)
+        cap.release()
+        cv2.destroyAllWindows()
 
-                            cv2.rectangle(annotated_frame, (int(x_left), int(y_top)), (int(x_right), int(y_bottom)), (0, 255, 0), 2)
-                            print(f"Class ID: {class_id}")
-
-            cv2.line(annotated_frame, (START.x, START.y), (END.x, END.y), (0, 255, 0), 2)
-
-            total_cost = 0
-            for class_id, tracks in products.items():
-                for track_id, track_info in tracks.items():
-                    if track_info['tracked']:
-                        total_cost += product_costs[class_id]
-
-            cost_text = f"Total Cost: {total_cost}"
-            print(cost_text)
-
-            cv2.putText(annotated_frame, cost_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            sink.write_frame(annotated_frame)
-
-            cv2.imshow('Smart Checkout System', annotated_frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    # Initialize the checkout system
+    checkout_system = SmartCheckoutSystem()
+    
+    # Example usage:
+    # 1. For webcam (default)
+    checkout_system.run()
+    
+    # 2. For video file (uncomment and modify path as needed)
+    # checkout_system.run("test_videos/video4.mp4")
