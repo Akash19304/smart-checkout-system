@@ -37,4 +37,4 @@ To run the smart checkout system:
 2. Place the input video (`video4.mp4` or other test videos) in the `test_videos/` directory.
 3. Run `main.py` to process the video and generate the output.
 
-![alt text](outputn.gif)
+![alt text](output4.gif)
